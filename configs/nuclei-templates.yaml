@@ -1,0 +1,49 @@
+---
+# Nuclei Template Configuration
+# This file defines which Nuclei templates to use
+
+# Template sources
+sources:
+  - name: nuclei-templates
+    url: https://github.com/projectdiscovery/nuclei-templates
+    branch: main
+
+# Template categories to include
+categories:
+  - cves              # Known CVEs
+  - vulnerabilities   # General vulnerabilities
+  - exposures         # Information exposures
+  - misconfigurations  # Security misconfigurations
+  - takeovers         # Subdomain takeovers
+  - default-logins    # Default credentials
+  - exposed-panels    # Exposed admin panels
+
+# Template categories to exclude
+excludeCategories:
+  - fuzzing           # Too noisy for baseline
+  - helpers           # Support templates
+  - workflows         # Complex workflows
+
+# Severity filters (applied in workflow, documented here)
+severity:
+  include:
+    - critical
+    - high
+    - medium
+  exclude:
+    - low
+    - info
+
+# Rate limiting
+rateLimit:
+  requestsPerSecond: 150
+  bulkSize: 25
+
+# Matchers configuration
+matchers:
+  status: true
+  size: false
+  words: true
+  regex: true
+  binary: false
+  dsl: true

@@ -1,0 +1,395 @@
+name: Centralized DAST Scan
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+        description: 'Application name for identification'
+      target_url:
+        required: true
+        type: string
+        description: 'Target URL to scan (must be accessible)'
+      scan_timeout:
+        required: false
+        type: number
+        default: 600
+        description: 'Scan timeout in seconds'
+      nuclei_version:
+        required: false
+        type: string
+        default: '3.7.0'
+        description: 'ProjectDiscovery Nuclei release version'
+      nuclei_severity:
+        required: false
+        type: string
+        default: 'critical,high,medium'
+        description: 'Comma-delimited severity levels passed to Nuclei'
+      policy_dir:
+        required: false
+        type: string
+        default: 'policies'
+        description: 'Path to the OPA policy directory'
+      opa_version:
+        required: false
+        type: string
+        default: 'latest'
+        description: 'OPA release tag used for policy evaluation (use "latest" or a specific version)'
+    secrets:
+      GH_TOKEN:
+        required: true
+      S3_ACCESS_KEY:
+        required: true
+      S3_SECRET_KEY:
+        required: true
+      S3_ENDPOINT:
+        required: true
+    outputs:
+      scan_status:
+        description: 'Overall scan status (PASS/WARN/FAIL)'
+        value: ${{ jobs.evaluate.outputs.status }}
+
+jobs:
+  zap-scan:
+    name: OWASP ZAP Baseline Scan
+    runs-on: ubuntu-latest
+    outputs:
+      zap_report: ${{ steps.upload.outputs.storage_path }}
+    env:
+      S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+      S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+      S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+    steps:
+      - name: Checkout DAST repository
+        uses: actions/checkout@v4
+        with:
+          repository: riowiraldhani/security-dast
+          ref: master
+
+      - name: Ensure report folder
+        run: |
+          mkdir -p reports
+          chmod 755 reports
+
+      - name: Run ZAP Baseline Scan
+        id: run
+        run: |
+          scripts/zap-baseline.sh "${{ inputs.target_url }}" reports "${{ inputs.scan_timeout }}"
+          echo "report_path=reports/zap-report.json" >> $GITHUB_OUTPUT
+
+      - name: Upload ZAP reports to S3
+        id: upload
+        if: always()
+        run: |
+          # Validate S3 credentials
+          if [ -z "${S3_ACCESS_KEY}" ] || [ -z "${S3_SECRET_KEY}" ] || [ -z "${S3_ENDPOINT}" ]; then
+            echo "::error::S3 credentials not configured. Please set S3_ACCESS_KEY, S3_SECRET_KEY, and S3_ENDPOINT secrets."
+            exit 1
+          fi
+          
+          # Install and configure AWS CLI
+          pip install awscli --quiet
+          aws configure set aws_access_key_id "${S3_ACCESS_KEY}"
+          aws configure set aws_secret_access_key "${S3_SECRET_KEY}"
+          aws configure set region us-east-1
+          
+          # Define storage path
+          STORAGE_PATH="s3://security-dast/${{ inputs.app_name }}/${{ github.run_id }}"
+          
+          # Upload ZAP reports
+          echo "Uploading ZAP reports to S3..."
+          aws --endpoint-url "${S3_ENDPOINT}" s3 cp reports/zap-report.json \
+            ${STORAGE_PATH}/zap-report.json --acl private || { echo "::error::Failed to upload zap-report.json"; exit 1; }
+
+          aws --endpoint-url "${S3_ENDPOINT}" s3 cp reports/zap-report.html \
+            ${STORAGE_PATH}/zap-report.html --acl private || { echo "::error::Failed to upload zap-report.html"; exit 1; }
+
+          if [ -f reports/zap-report.md ]; then
+            aws --endpoint-url "${S3_ENDPOINT}" s3 cp reports/zap-report.md \
+              ${STORAGE_PATH}/zap-report.md --acl private || echo "::warning::Failed to upload zap-report.md"
+          fi
+
+          echo "✓ ZAP reports uploaded to S3 successfully"
+          echo "storage_path=${STORAGE_PATH}" >> $GITHUB_OUTPUT
+
+  nuclei-scan:
+    name: Nuclei Vulnerability Scan
+    runs-on: ubuntu-latest
+    outputs:
+      nuclei_report: ${{ steps.upload.outputs.storage_path }}
+    env:
+      S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+      S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+      S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+    steps:
+      - name: Checkout DAST repository
+        uses: actions/checkout@v4
+        with:
+          repository: riowiraldhani/security-dast
+          ref: master
+
+      - name: Run Nuclei Scan
+        id: run
+        env:
+          NUCLEI_VERSION: ${{ inputs.nuclei_version }}
+        run: |
+          scripts/nuclei-scan.sh "${{ inputs.target_url }}" reports "${{ inputs.nuclei_severity }}"
+          echo "report_path=reports/nuclei-report.json" >> $GITHUB_OUTPUT
+
+      - name: Upload Nuclei report to S3
+        id: upload
+        if: always()
+        run: |
+          # Validate S3 credentials
+          if [ -z "${S3_ACCESS_KEY}" ] || [ -z "${S3_SECRET_KEY}" ] || [ -z "${S3_ENDPOINT}" ]; then
+            echo "::error::S3 credentials not configured. Please set S3_ACCESS_KEY, S3_SECRET_KEY, and S3_ENDPOINT secrets."
+            exit 1
+          fi
+          
+          # Install and configure AWS CLI
+          pip install awscli --quiet
+          aws configure set aws_access_key_id "${S3_ACCESS_KEY}"
+          aws configure set aws_secret_access_key "${S3_SECRET_KEY}"
+          aws configure set region us-east-1
+          
+          # Define storage path
+          STORAGE_PATH="s3://security-dast/${{ inputs.app_name }}/${{ github.run_id }}"
+          
+          # Upload Nuclei report
+          if [ -f reports/nuclei-report.json ]; then
+            echo "Uploading Nuclei report to S3..."
+            aws --endpoint-url "${S3_ENDPOINT}" s3 cp reports/nuclei-report.json \
+            ${STORAGE_PATH}/nuclei-report.json --acl private || { echo "::error::Failed to upload nuclei-report.json"; exit 1; }
+            echo "✓ Nuclei report uploaded to S3 successfully"
+          else
+            echo "::warning::Nuclei report not found, skipping upload"
+          fi
+          
+          echo "storage_path=${STORAGE_PATH}" >> $GITHUB_OUTPUT
+
+  evaluate:
+    name: Risk Evaluation
+    runs-on: ubuntu-latest
+    needs: [zap-scan, nuclei-scan]
+    outputs:
+      status: ${{ steps.eval.outputs.status }}
+      summary: ${{ steps.summary.outputs.summary }}
+      storage_url: ${{ steps.upload-eval.outputs.storage_url }}
+    env:
+      S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+      S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+      S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+    steps:
+      - name: Checkout DAST repository
+        uses: actions/checkout@v4
+        with:
+          repository: riowiraldhani/security-dast
+          ref: master
+
+      - name: Download reports from S3
+        run: |
+          # Validate S3 credentials
+          if [ -z "${S3_ACCESS_KEY}" ] || [ -z "${S3_SECRET_KEY}" ] || [ -z "${S3_ENDPOINT}" ]; then
+            echo "::error::S3 credentials not configured."
+            exit 1
+          fi
+          
+          # Install and configure AWS CLI
+          pip install awscli --quiet
+          aws configure set aws_access_key_id "${S3_ACCESS_KEY}"
+          aws configure set aws_secret_access_key "${S3_SECRET_KEY}"
+          aws configure set region us-east-1
+          
+          # Create directories
+          mkdir -p reports/zap reports/nuclei
+          
+          # Define storage path
+          STORAGE_PATH="s3://security-dast/${{ inputs.app_name }}/${{ github.run_id }}"
+          
+          # Download ZAP reports
+          echo "Downloading ZAP reports from storage..."
+          aws --endpoint-url "${S3_ENDPOINT}" s3 cp ${STORAGE_PATH}/zap-report.json \
+            reports/zap/zap-report.json || { echo "::error::Failed to download zap-report.json"; exit 1; }
+          
+          aws --endpoint-url "${S3_ENDPOINT}" s3 cp ${STORAGE_PATH}/zap-report.html \
+            reports/zap/zap-report.html || echo "::warning::Failed to download zap-report.html"
+          
+          aws --endpoint-url "${S3_ENDPOINT}" s3 cp ${STORAGE_PATH}/zap-report.md \
+            reports/zap/zap-report.md || echo "::warning::Failed to download zap-report.md"
+          
+          # Download Nuclei report
+          echo "Downloading Nuclei report from storage..."
+          aws --endpoint-url "${S3_ENDPOINT}" s3 cp ${STORAGE_PATH}/nuclei-report.json \
+            reports/nuclei/nuclei-report.json || echo "::warning::Failed to download nuclei-report.json"
+         
+          echo "✓ Reports downloaded from storage successfully"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Risk Evaluator
+        id: eval
+        run: |
+          python scripts/risk-evaluator.py \
+            --app-name "${{ inputs.app_name }}" \
+            --zap-report reports/zap/zap-report.json \
+            --nuclei-report reports/nuclei/nuclei-report.json \
+            --opa-version "${{ inputs.opa_version }}" \
+            --output reports/evaluation.json \
+            --policy-dir "${{ inputs.policy_dir }}"
+
+          STATUS=$(jq -r '.status' reports/evaluation.json)
+          echo "status=${STATUS}" >> $GITHUB_OUTPUT
+
+      - name: Generate tuning suggestions
+        run: |
+          python scripts/tuning-helper.py \
+            --input reports/evaluation.json \
+            --output reports/tuning-suggestions.md \
+            --json reports/tuning-suggestions.json
+
+      - name: Fetch previous evaluation
+        if: env.S3_ACCESS_KEY != '' && env.S3_SECRET_KEY != '' && env.S3_ENDPOINT != ''
+        run: |
+          set +e
+          aws --endpoint-url "${S3_ENDPOINT}" s3 cp \
+            s3://security-dast/${{ inputs.app_name }}/latest/evaluation.json \
+            reports/previous-evaluation.json
+          set -e
+
+      - name: Run regression guard
+        if: env.S3_ACCESS_KEY != '' && env.S3_SECRET_KEY != '' && env.S3_ENDPOINT != ''
+        run: |
+          python scripts/regression-guard.py \
+            --current reports/evaluation.json \
+            --previous reports/previous-evaluation.json \
+            --threshold 5
+
+      - name: Upload Evaluation report to S3
+        id: upload-eval
+        run: |
+          if [ -z "${S3_ACCESS_KEY}" ] || [ -z "${S3_SECRET_KEY}" ] || [ -z "${S3_ENDPOINT}" ]; then
+            echo "::error::S3 credentials required for evaluation upload."
+            exit 1
+          fi
+
+          pip install awscli --quiet
+          aws configure set aws_access_key_id "${S3_ACCESS_KEY}"
+          aws configure set aws_secret_access_key "${S3_SECRET_KEY}"
+          aws configure set region us-east-1
+
+          STORAGE_PATH="s3://security-dast/${{ inputs.app_name }}/${{ github.run_id }}"
+
+          if [ ! -f reports/evaluation.json ]; then
+            echo "::error::Evaluation report not found"
+            exit 1
+          fi
+
+          echo "Uploading evaluation + tuning guidance to S3..."
+          aws --endpoint-url "${S3_ENDPOINT}" s3 cp reports/evaluation.json \
+            ${STORAGE_PATH}/evaluation.json --acl private || { echo "::error::Failed to upload evaluation.json"; exit 1; }
+
+          if [ -f reports/tuning-suggestions.md ]; then
+            aws --endpoint-url "${S3_ENDPOINT}" s3 cp reports/tuning-suggestions.md \
+            ${STORAGE_PATH}/tuning-suggestions.md --acl private || echo "::warning::Failed to upload tuning-suggestions.md"
+          fi
+
+          if [ -f reports/tuning-suggestions.json ]; then
+            aws --endpoint-url "${S3_ENDPOINT}" s3 cp reports/tuning-suggestions.json \
+            ${STORAGE_PATH}/tuning-suggestions.json --acl private || echo "::warning::Failed to upload tuning-suggestions.json"
+          fi
+
+          aws --endpoint-url "${S3_ENDPOINT}" s3 cp reports/evaluation.json \
+            s3://security-dast/${{ inputs.app_name }}/latest/evaluation.json --acl private || \
+            echo "::warning::Failed to update latest evaluation pointer"
+
+          STORAGE_URL="${S3_ENDPOINT}/security-dast/${{ inputs.app_name }}/${{ github.run_id }}/"
+          echo "storage_url=${STORAGE_URL}" >> $GITHUB_OUTPUT
+          echo "${STORAGE_URL}" > reports/storage-link.txt
+
+      - name: Verify all files in S3 bucket
+        if: always()
+        run: |
+          echo "Verifying all files uploaded to S3..."
+          STORAGE_PATH="s3://security-dast/${{ inputs.app_name }}/${{ github.run_id }}"
+          
+          echo "Files in S3:"
+          aws --endpoint-url "${S3_ENDPOINT}" s3 ls ${STORAGE_PATH}/ || echo "::warning::Failed to list S3 contents"
+          
+          echo ""
+          echo "Expected files:"
+          echo "  - zap-report.json"
+          echo "  - zap-report.html"
+          echo "  - zap-report.md"
+          echo "  - nuclei-report.json"
+          echo "  - evaluation.json"
+          echo "  - tuning-suggestions.md"
+          echo "  - tuning-suggestions.json"
+
+      - name: Generate report summary
+        id: summary
+        run: |
+          STORAGE_URL=""
+          if [ -f reports/storage-link.txt ]; then
+            STORAGE_URL="$(cat reports/storage-link.txt)"
+          fi
+          
+          # Get artifacts URL (for GitHub Actions run page)
+          ARTIFACTS_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          
+          python scripts/report-generator.py \
+            --input reports/evaluation.json \
+            --output reports/summary.md \
+            --artifacts-url "${ARTIFACTS_URL}" \
+            --storage-url "${STORAGE_URL}" \
+            --tuning-json reports/tuning-suggestions.json
+
+          SUMMARY_CONTENT="$(cat reports/summary.md)"
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          echo "$SUMMARY_CONTENT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Comment PR with summary
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const summary = ${{ toJson(steps.summary.outputs.summary) }};
+            const storageUrl = ${{ toJson(steps.upload-eval.outputs.storage_url) }};
+            
+            let comment = summary;
+            
+            // Add storage URL section if available
+            if (storageUrl && storageUrl.trim() !== '') {
+              const storageSection = "\n\n## Storage - All Scan Reports\n\n" +
+                "**All scan reports are stored in S3 and available at:**\n\n" +
+                `**[View All Reports](${storageUrl})**\n\n` +
+                "### Available Files:\n\n" +
+                "| File | Description |\n" +
+                "|------|-------------|\n" +
+                "| `zap-report.json` | OWASP ZAP scan results (JSON format) |\n" +
+                "| `zap-report.html` | OWASP ZAP scan results (HTML format - viewable in browser) |\n" +
+                "| `zap-report.md` | OWASP ZAP scan results (Markdown format) |\n" +
+                "| `nuclei-report.json` | Nuclei vulnerability scan results |\n" +
+                "| `evaluation.json` | Risk evaluation and compliance report |\n\n" +
+                "> All reports are stored in S3 (or any compatible object store). No GitHub artifacts are created.\n";
+            }
+
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Fail on critical or high severity
+        if: steps.eval.outputs.status == 'FAIL'
+        run: |
+          echo "::error::Critical or High severity vulnerabilities detected"
+          echo "Please review the scan reports in S3: ${{ steps.upload-eval.outputs.storage_url }}"
+          exit 1

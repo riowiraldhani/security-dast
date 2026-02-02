@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+
+# Reports generated during runs
+reports/
+
+# OS
+.DS_Store

@@ -1,0 +1,15 @@
+{
+  "app_name": "policy-health-check",
+  "findings": [
+    {
+      "source": "ZAP",
+      "name": "Sample Low Issue",
+      "severity": "LOW",
+      "description": "Synthetic finding for policy health checks",
+      "solution": "Ignore for health checks",
+      "location": "http://example.com/health",
+      "rule_id": "90000",
+      "scanner": "ZAP"
+    }
+  ]
+}
